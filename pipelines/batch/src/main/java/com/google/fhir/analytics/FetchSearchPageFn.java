@@ -28,7 +28,6 @@ import com.google.fhir.analytics.view.ViewApplicationException;
 import java.io.IOException;
 import java.sql.SQLException;
 import java.util.Set;
-import javax.annotation.Nullable;
 import javax.sql.DataSource;
 import org.apache.beam.sdk.metrics.Counter;
 import org.apache.beam.sdk.metrics.Metrics;
@@ -37,6 +36,7 @@ import org.apache.beam.sdk.values.KV;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Bundle.BundleEntryComponent;
 import org.hl7.fhir.r4.model.Resource;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,7 +86,11 @@ abstract class FetchSearchPageFn<T> extends DoFn<T, KV<String, Integer>> {
 
   protected final String stageIdentifier;
 
-  protected final String parquetFile;
+  protected final String outputParquetPath;
+
+  private final String inputParquetPath;
+
+  private final String outputParquetViewPath;
 
   protected final Boolean generateParquetFiles;
 
@@ -98,13 +102,13 @@ abstract class FetchSearchPageFn<T> extends DoFn<T, KV<String, Integer>> {
 
   private final int recursiveDepth;
 
-  protected final DataSourceConfig sinkDbConfig;
+  @Nullable protected final DataSourceConfig sinkDbConfig;
 
   protected final String viewDefinitionsDir;
 
   private final int maxPoolSize;
 
-  @VisibleForTesting protected ParquetUtil parquetUtil;
+  @VisibleForTesting @Nullable protected ParquetUtil parquetUtil;
 
   protected FetchUtil fetchUtil;
 
@@ -122,10 +126,8 @@ abstract class FetchSearchPageFn<T> extends DoFn<T, KV<String, Integer>> {
 
   protected AvroConversionUtil avroConversionUtil;
 
-  private final boolean createParquetViews;
-
   FetchSearchPageFn(FhirEtlOptions options, String stageIdentifier) {
-    this.createParquetViews = options.isCreateParquetViews();
+    this.outputParquetViewPath = options.getOutputParquetViewPath();
     this.sinkPath = options.getFhirSinkPath();
     this.sinkUsername = options.getSinkUserName();
     this.sinkPassword = options.getSinkPassword();
@@ -136,10 +138,12 @@ abstract class FetchSearchPageFn<T> extends DoFn<T, KV<String, Integer>> {
     this.oAuthClientId = options.getFhirServerOAuthClientId();
     this.oAuthClientSecret = options.getFhirServerOAuthClientSecret();
     this.stageIdentifier = stageIdentifier;
-    this.parquetFile = options.getOutputParquetPath();
+    this.outputParquetPath = options.getOutputParquetPath();
+    this.inputParquetPath = options.getParquetInputDwhRoot();
     this.generateParquetFiles = options.isGenerateParquetFiles();
     this.secondsToFlush = options.getSecondsToFlushParquetFiles();
     this.rowGroupSize = options.getRowGroupSizeForParquetFiles();
+    // TODO enable the caching feature for all runners.
     if (DATAFLOW_RUNNER.equals(options.getRunner().getSimpleName())) {
       this.cacheBundle = options.getCacheBundleForParquetWrites();
     } else {
@@ -213,14 +217,18 @@ abstract class FetchSearchPageFn<T> extends DoFn<T, KV<String, Integer>> {
             oAuthClientSecret,
             fhirContext);
     fhirSearchUtil = new FhirSearchUtil(fetchUtil);
-    if (generateParquetFiles && !Strings.isNullOrEmpty(parquetFile)) {
+    // TODO remove generateParquetFiles and instead rely on not setting outputParquetPath.
+    if (generateParquetFiles
+        && (!Strings.isNullOrEmpty(outputParquetPath)
+            || !Strings.isNullOrEmpty(outputParquetViewPath))) {
       parquetUtil =
           new ParquetUtil(
               fhirContext.getVersion().getVersion(),
               structureDefinitionsPath,
-              parquetFile,
+              outputParquetPath,
+              inputParquetPath,
               viewDefinitionsDir,
-              createParquetViews,
+              outputParquetViewPath,
               secondsToFlush,
               rowGroupSize,
               stageIdentifier + "_",
@@ -253,14 +261,11 @@ abstract class FetchSearchPageFn<T> extends DoFn<T, KV<String, Integer>> {
   public void finishBundle(FinishBundleContext context) {
     try {
       if (DATAFLOW_RUNNER.equals(context.getPipelineOptions().getRunner().getSimpleName())) {
-        if (cacheBundle) {
-          parquetUtil.emptyCache();
-        }
         if (parquetUtil != null) {
-          parquetUtil.flushAll();
+          parquetUtil.flushAllWriters();
         }
       }
-    } catch (IOException | ProfileException e) {
+    } catch (IOException e) {
       // There is not much that we can do at finishBundle so just throw a RuntimeException
       log.error("At finishBundle caught exception ", e);
       throw new IllegalStateException(e);
@@ -274,7 +279,7 @@ abstract class FetchSearchPageFn<T> extends DoFn<T, KV<String, Integer>> {
     // DataflowRunner and that's why we have the finishBundle method above:
     // https://beam.apache.org/releases/javadoc/current/org/apache/beam/sdk/transforms/DoFn.Teardown.html
     if (parquetUtil != null) {
-      parquetUtil.closeAllWriters();
+      parquetUtil.flushAllWritersAndStopTimer();
     }
   }
 
